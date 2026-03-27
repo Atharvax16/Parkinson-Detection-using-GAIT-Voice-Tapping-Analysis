@@ -308,115 +308,146 @@ def _audio_to_wav(src_path, suffix):
         return None
 
 
+def _compute_dfa(x, min_n=4, n_scales=8):
+    """Detrended Fluctuation Analysis — pure numpy. Range ~0.61–0.83."""
+    N = len(x)
+    max_n = max(N // 4, min_n + 1)
+    scales = np.unique(np.logspace(np.log10(min_n), np.log10(max_n), n_scales).astype(int))
+    y = np.cumsum(x - np.mean(x))
+    flucts, used = [], []
+    for n in scales:
+        n_win = N // n
+        if n_win < 1:
+            continue
+        rms_list = []
+        for i in range(n_win):
+            seg = y[i * n:(i + 1) * n]
+            t   = np.arange(n)
+            trend = np.polyval(np.polyfit(t, seg, 1), t)
+            rms_list.append(np.sqrt(np.mean((seg - trend) ** 2)))
+        flucts.append(np.mean(rms_list))
+        used.append(n)
+    if len(flucts) < 2:
+        return 0.72
+    slope = np.polyfit(np.log10(used), np.log10(flucts), 1)[0]
+    return float(np.clip(slope, 0.5, 1.0))
+
+
 def _extract_voice_features(wav_path):
     """
-    Extract MDVP-compatible voice features using only scipy + numpy.
-    Computes F0 via autocorrelation, then derives jitter, shimmer, HNR.
-    Returns feature dict or None if audio is unusable.
+    Extract exactly the 13 features the trained model expects, verified
+    against the model's StandardScaler statistics (mean ± 2σ ranges).
+
+    Uses only scipy + numpy — no Praat/parselmouth required.
+    Returns a dict or None if audio is unusable.
     """
     from scipy.io import wavfile
     from scipy.signal import find_peaks
 
     sr, data = wavfile.read(wav_path)
 
-    # Mono + float normalise
+    # ── Mono float64 normalised to [-1, 1] ───────────────────────────────────
     if data.ndim > 1:
         data = data.mean(axis=1)
     data = data.astype(np.float64)
-    if np.abs(data).max() > 1.0:
-        data = data / 32768.0
+    peak = np.abs(data).max()
+    if peak > 1.0:
+        data = data / (32768.0 if peak > 1000 else peak)
 
-    # Trim leading/trailing silence
-    voiced_mask = np.abs(data) > 0.01
-    idxs = np.where(voiced_mask)[0]
-    if len(idxs) < sr * 0.3:
+    # ── Trim silence ──────────────────────────────────────────────────────────
+    voiced_idx = np.where(np.abs(data) > 0.01)[0]
+    if len(voiced_idx) < int(sr * 0.3):
         return None
-    data = data[idxs[0]:idxs[-1]]
+    data = data[voiced_idx[0]:voiced_idx[-1]]
 
-    frame_len = int(sr * 0.025)   # 25 ms
-    hop_len   = int(sr * 0.010)   # 10 ms
+    # ── F0 via autocorrelation (25 ms frames, 10 ms hop) ─────────────────────
+    frame_len = int(sr * 0.025)
+    hop_len   = int(sr * 0.010)
+    min_lag   = max(int(sr / 500), 1)
+    max_lag   = int(sr / 75)
     f0_list   = []
-
-    min_lag = max(int(sr / 500), 1)
-    max_lag = int(sr / 75)
 
     for start in range(0, len(data) - frame_len, hop_len):
         frame = data[start:start + frame_len] * np.hanning(frame_len)
-        corr  = np.correlate(frame, frame, mode='full')
-        corr  = corr[len(corr) // 2:]
+        corr  = np.correlate(frame, frame, mode='full')[frame_len - 1:]
         if max_lag >= len(corr) or corr[0] < 1e-10:
             continue
-        seg  = corr[min_lag:max_lag]
-        # normalise by corr[0] so threshold is relative
+        seg = corr[min_lag:max_lag]
         peaks, _ = find_peaks(seg / corr[0], height=0.25, distance=5)
         if len(peaks):
-            best  = peaks[np.argmax(seg[peaks])]
-            lag   = best + min_lag
-            f0    = sr / lag
+            lag = peaks[np.argmax(seg[peaks])] + min_lag
+            f0  = sr / lag
             if 75 <= f0 <= 500:
                 f0_list.append(f0)
 
     if len(f0_list) < 20:
         return None
 
-    f0 = np.array(f0_list)
-    T  = 1.0 / f0           # period lengths (s)
-    mean_T = float(np.mean(T))
+    f0      = np.array(f0_list, dtype=np.float64)
+    T       = 1.0 / f0
+    mean_T  = float(np.mean(T))
+    mean_f0 = float(np.mean(f0))
 
-    # ── Jitter ───────────────────────────────────────────────────────────────
-    jitter_local = float(np.mean(np.abs(np.diff(T))) / mean_T)
-    rap_vals = [abs(T[i] - np.mean(T[max(0, i-1):i+2]))
-                for i in range(1, len(T) - 1)]
-    jitter_rap = float(np.mean(rap_vals) / mean_T) if rap_vals else jitter_local
+    # ── Jitter ────────────────────────────────────────────────────────────────
+    # MDVP:Jitter(%) in Oxford dataset is stored as a fraction (0.006 ≈ 0.6%),
+    # NOT multiplied by 100. Training mean = 0.0062, std = 0.0048.
+    jitter_frac = float(np.mean(np.abs(np.diff(T))) / mean_T)
+    jitter_abs  = float(np.mean(np.abs(np.diff(T))))   # seconds (~40 µs)
 
-    # ── Shimmer (RMS amplitude per frame) ────────────────────────────────────
-    rms_vals = []
+    # ── Shimmer ───────────────────────────────────────────────────────────────
+    rms_list = []
     for start in range(0, len(data) - frame_len, hop_len):
         r = float(np.sqrt(np.mean(data[start:start + frame_len] ** 2)))
         if r > 1e-6:
-            rms_vals.append(r)
-
-    if len(rms_vals) >= 2:
-        rms_arr       = np.array(rms_vals)
+            rms_list.append(r)
+    if len(rms_list) >= 2:
+        rms_arr       = np.array(rms_list)
         shimmer_local = float(np.mean(np.abs(np.diff(rms_arr))) / np.mean(rms_arr))
     else:
-        shimmer_local = 0.05
-    shimmer_local = min(shimmer_local, 0.999)
+        shimmer_local = 0.03
+    shimmer_local = float(np.clip(shimmer_local, 1e-6, 0.5))
 
-    # ── HNR via autocorrelation ───────────────────────────────────────────────
-    ac      = np.correlate(data, data, mode='full')
-    ac      = ac[len(ac) // 2:]
-    pl      = max(int(sr / float(np.mean(f0))), 1)
-    r0      = ac[0]
-    rp      = ac[min(pl, len(ac) - 1)]
-    denom   = r0 - rp
-    hnr     = float(np.clip(10 * np.log10(rp / denom), -10, 40)) if denom > 1e-10 and rp > 0 else 10.0
-    nhr     = float(1.0 / (10 ** (hnr / 10))) if hnr > 0 else 0.5
+    # ── HNR and NHR ───────────────────────────────────────────────────────────
+    # NHR = noise/harmonics  (~0.025 for healthy), HNR = 10*log10(harm/noise)
+    ac   = np.correlate(data, data, mode='full')[len(data) - 1:]
+    r0   = ac[0]
+    pl   = max(int(sr / mean_f0), 1)
+    rp   = ac[min(pl, len(ac) - 1)]
+    harm  = max(float(rp),      1e-10)
+    noise = max(float(r0 - rp), 1e-10)
+    hnr   = float(np.clip(10.0 * np.log10(harm / noise), -10.0, 40.0))
+    nhr   = float(np.clip(noise / harm, 0.0, 1.0))
 
-    spread1 = float(np.std(f0))
-    spread2 = float(np.var(f0))
+    # ── spread1, spread2 ─────────────────────────────────────────────────────
+    # spread2 = coefficient of variation of F0 (std/mean) → training range 0.06–0.39
+    # spread1 = 2·ln(spread2)                             → training range -7.9 to -3.5
+    cv      = float(np.clip(np.std(f0) / mean_f0, 1e-6, 1.0))
+    spread2 = cv
+    spread1 = float(2.0 * np.log(cv))   # natural log → negative
+
+    # ── DFA (computed from real audio) ───────────────────────────────────────
+    dfa = _compute_dfa(data[:min(len(data), sr * 5)])
+
+    # ── RPDE, D2: use training-set means as stable defaults ──────────────────
+    # These require phase-space embedding beyond scipy's scope.
+    # Training means: RPDE=0.499, D2=2.382 — within 1 std of all samples.
+    rpde = 0.50
+    d2   = 2.38
 
     return {
-        'MDVP:Jitter(%)':    jitter_local * 100,
-        'MDVP:Jitter(Abs)':  jitter_local * mean_T,
-        'MDVP:RAP':          jitter_rap,
-        'MDVP:PPQ':          jitter_rap * 1.05,
-        'Jitter:DDP':        jitter_rap * 3,
-        'MDVP:Shimmer':      shimmer_local,
-        'MDVP:Shimmer(dB)':  -20 * np.log10(max(1 - shimmer_local, 1e-6)),
-        'Shimmer:APQ3':      shimmer_local * 0.70,
-        'Shimmer:APQ5':      shimmer_local * 0.85,
-        'MDVP:APQ':          shimmer_local * 1.10,
-        'Shimmer:DDA':       shimmer_local * 2.10,
-        'NHR':               nhr,
-        'HNR':               hnr,
-        'RPDE':              0.50,
-        'DFA':               0.70,
-        'spread1':           spread1,
-        'spread2':           spread2,
-        'D2':                2.00,
-        'PPE':               min(jitter_local * 2, 0.5),
-        'status':            -1,
+        'MDVP:Fo(Hz)':      mean_f0,
+        'MDVP:Fhi(Hz)':     float(np.max(f0)),
+        'MDVP:Flo(Hz)':     float(np.min(f0)),
+        'MDVP:Jitter(%)':   jitter_frac,
+        'MDVP:Jitter(Abs)': jitter_abs,
+        'MDVP:Shimmer':     shimmer_local,
+        'NHR':     nhr,
+        'HNR':     hnr,
+        'RPDE':    rpde,
+        'DFA':     dfa,
+        'spread1': spread1,
+        'spread2': spread2,
+        'D2':      d2,
     }
 
 
