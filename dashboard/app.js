@@ -6,32 +6,49 @@ let lastGaitHash = null, lastTapHash = null, lastVoiceHash = null;
 
 // ── Init ────────────────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
-    fetchAndRenderQR();
+    pollQR();
+    setInterval(pollQR, 5000);   // re-check every 5s — picks up ngrok when it starts
     setInterval(poll, 2000);
     poll();
 });
 
 // ── QR Code ─────────────────────────────────────────────────────────────────
-async function fetchAndRenderQR() {
+let lastPhoneUrl = null;
+
+async function pollQR() {
     let phoneUrl;
+    let isHttps = false;
     try {
         const r = await fetch(`${API}/api/server-info`);
         const d = await r.json();
         if (d.base_url) {
-            // ngrok tunnel active — use it directly (HTTPS, works on iPhone)
+            // ngrok URL or self-signed HTTPS — already fully qualified
             phoneUrl = `${d.base_url}/phone`;
+            isHttps = !!d.https;
         } else {
             const proto = d.https ? 'https' : 'http';
             const port  = d.port  ? `:${d.port}` : '';
             phoneUrl = `${proto}://${d.ip}${port}/phone`;
+            isHttps  = !!d.https;
         }
     } catch {
         phoneUrl = `${window.location.origin}/phone`;
+        isHttps  = window.location.protocol === 'https:';
     }
+
+    if (phoneUrl === lastPhoneUrl) return;   // nothing changed
+    lastPhoneUrl = phoneUrl;
 
     const qrEl = document.getElementById('qrCode');
     const urlEl = document.getElementById('qrUrl');
-    urlEl.textContent = phoneUrl;
+
+    // Make the URL a clickable link and colour-code http vs https
+    urlEl.innerHTML = `<a href="${phoneUrl}" target="_blank"
+        style="color:${isHttps ? '#198754' : '#dc3545'};text-decoration:none;word-break:break-all;">
+        ${phoneUrl}</a>
+        ${isHttps ? '<span style="font-size:10px;background:#d1e7dd;color:#0f5132;padding:2px 6px;border-radius:4px;margin-left:4px;">HTTPS ✓</span>'
+                  : '<span style="font-size:10px;background:#f8d7da;color:#842029;padding:2px 6px;border-radius:4px;margin-left:4px;">HTTP — start ngrok!</span>'}`;
+
     try {
         const qr = qrcode(0, 'M');
         qr.addData(phoneUrl);

@@ -246,6 +246,35 @@
             background: var(--purple);
             transition: height .1s;
         }
+
+        /* HTTPS warning banner */
+        #https-banner {
+            display: none;
+            background: #fff3cd;
+            border-left: 4px solid #ffc107;
+            padding: 14px 16px;
+            font-size: 13px;
+            color: #664d03;
+            line-height: 1.6;
+        }
+        #https-banner strong { display: block; font-size: 14px; margin-bottom: 4px; color: #3d2c00; }
+        #https-open-btn {
+            display: inline-block;
+            margin-top: 10px;
+            background: #0d6efd;
+            color: white;
+            font-weight: 700;
+            font-size: 13px;
+            padding: 8px 14px;
+            border-radius: 8px;
+            text-decoration: none;
+            word-break: break-all;
+            cursor: pointer;
+        }
+        #https-open-btn.no-link {
+            background: #6c757d;
+            cursor: default;
+        }
     </style>
 </head>
 <body>
@@ -262,6 +291,13 @@
     <label>Server IP</label>
     <input type="text" id="serverIp" placeholder="192.168.x.x:5000" inputmode="url">
     <div class="conn-dot" id="connDot"></div>
+</div>
+
+<div id="https-banner">
+    <strong>⚠️ HTTPS required for motion sensors</strong>
+    You are on HTTP. Safari blocks motion sensors on HTTP.
+    Open the secure HTTPS link below instead:
+    <br><a id="https-open-btn" href="#" target="_blank">Loading HTTPS URL...</a>
 </div>
 
 <div class="tabs">
@@ -428,10 +464,17 @@ let mediaRecorder, audioChunks = [], voiceInterval, voiceAnimInterval;
 let currentTab = 'gait';
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+const PAGE_HTTPS = location.protocol === 'https:';
+const IS_LOCALHOST = location.hostname === 'localhost' || location.hostname === '127.0.0.1';
+const NEEDS_HTTPS = !PAGE_HTTPS && !IS_LOCALHOST;
+
 function getBase() {
     const v = document.getElementById('serverIp').value.trim();
     if (!v) return null;
-    return v.startsWith('http') ? v : `http://${v}`;
+    if (v.startsWith('http')) return v;
+    // Use the same protocol as this page so mixed-content is avoided
+    const proto = PAGE_HTTPS ? 'https' : 'http';
+    return `${proto}://${v}`;
 }
 
 function showScreen(id) {
@@ -449,10 +492,51 @@ function switchTab(tab) {
                tab === 'tapping' ? 'tap-instructions' : 'voice-instructions');
 }
 
-// Auto-fill IP from page URL
+// Auto-fill IP from page URL + HTTPS detection
 (function() {
     const host = window.location.host;
     document.getElementById('serverIp').value = host || 'localhost:5000';
+
+    // Show HTTPS warning banner if on HTTP (and not localhost)
+    if (NEEDS_HTTPS) {
+        const banner = document.getElementById('https-banner');
+        banner.style.display = 'block';
+        const btn = document.getElementById('https-open-btn');
+
+        // Start with a "loading" state — don't guess the URL yet
+        btn.textContent = 'Fetching HTTPS URL…';
+        btn.removeAttribute('href');
+        btn.classList.add('no-link');
+
+        // Poll server-info until we get a valid HTTPS URL
+        const httpBase = `http://${host}`;
+        function fetchHttpsUrl() {
+            fetch(httpBase + '/api/server-info', { signal: AbortSignal.timeout(3000) })
+                .then(r => r.json())
+                .then(d => {
+                    if (d.base_url && d.https) {
+                        // ngrok tunnel or self-signed HTTPS — use it directly
+                        const url = d.base_url.replace('http://', 'https://') + '/phone';
+                        btn.href = url;
+                        btn.textContent = url;
+                        btn.classList.remove('no-link');
+                    } else if (d.https) {
+                        // Flask running HTTPS on the same host/port
+                        const url = 'https://' + host + '/phone';
+                        btn.href = url;
+                        btn.textContent = url;
+                        btn.classList.remove('no-link');
+                    } else {
+                        // HTTP mode with no ngrok yet — keep polling
+                        btn.textContent = 'Waiting for ngrok HTTPS URL…';
+                        setTimeout(fetchHttpsUrl, 3000);
+                    }
+                })
+                .catch(() => setTimeout(fetchHttpsUrl, 3000));
+        }
+        fetchHttpsUrl();
+    }
+
     setInterval(async () => {
         const base = getBase();
         if (!base) return;
@@ -467,9 +551,23 @@ function switchTab(tab) {
 async function startGait() {
     if (!getBase()) { alert('Enter server IP first.'); return; }
 
+    // Block immediately if on HTTP — motion sensors will never work
+    if (NEEDS_HTTPS) {
+        const btn = document.getElementById('https-open-btn');
+        const httpsUrl = btn && btn.href && btn.href !== '#' ? btn.href : null;
+        document.getElementById('gaitErrorText').textContent = httpsUrl
+            ? 'Motion sensors need HTTPS. Tap the yellow banner at the top to open the secure URL, then try again.'
+            : 'Motion sensors need HTTPS. Run  python start.py --ngrok  and open the https:// URL it gives you.';
+        showScreen('gait-error'); return;
+    }
+
+    const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
+
     if (typeof DeviceMotionEvent === 'undefined') {
-        document.getElementById('gaitErrorText').textContent =
-            'Motion sensors not available. Use Chrome on Android, or Safari on iOS over HTTPS.';
+        const msg = isIOS
+            ? 'You must use Safari on iPhone — Chrome on iOS does not support motion sensors. Copy this URL and open it in Safari.'
+            : 'Motion sensors not available. Use Chrome on Android or Safari on iPhone over HTTPS.';
+        document.getElementById('gaitErrorText').textContent = msg;
         showScreen('gait-error'); return;
     }
 
@@ -478,13 +576,12 @@ async function startGait() {
             const perm = await DeviceMotionEvent.requestPermission();
             if (perm !== 'granted') {
                 document.getElementById('gaitErrorText').textContent =
-                    'Motion permission denied.\n\n' +
-                    'iOS requires HTTPS. Restart server with:\n  python backend/app.py --https\n' +
-                    'Then open https://<ip>:5000/phone and accept the certificate.';
+                    'Motion access denied by Safari.\n\nTo reset: go to iPhone Settings > Privacy & Security > Motion & Fitness, enable Safari. Then reload this page and try again.';
                 showScreen('gait-error'); return;
             }
         } catch(e) {
-            document.getElementById('gaitErrorText').textContent = 'Permission error: ' + e.message;
+            document.getElementById('gaitErrorText').textContent =
+                'Permission error: ' + e.message + '\n\nMake sure this page is open over HTTPS (the URL must start with https://).';
             showScreen('gait-error'); return;
         }
     }
@@ -590,7 +687,11 @@ async function startVoice() {
     try {
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
         audioChunks = [];
-        mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+        // Safari/iOS uses mp4; Chrome/Android uses webm
+        const mimeType = MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm'
+                       : MediaRecorder.isTypeSupported('audio/mp4')  ? 'audio/mp4'
+                       : '';
+        mediaRecorder = new MediaRecorder(stream, mimeType ? { mimeType } : {});
         mediaRecorder.ondataavailable = e => { if (e.data.size > 0) audioChunks.push(e.data); };
         mediaRecorder.start(100);
         showScreen('voice-recording');
@@ -617,6 +718,32 @@ async function startVoice() {
     }
 }
 
+// Encode Float32 PCM samples → WAV Blob (no library needed)
+function encodeWav(samples, sampleRate) {
+    const buf  = new ArrayBuffer(44 + samples.length * 2);
+    const view = new DataView(buf);
+    const str  = (off, s) => { for (let i = 0; i < s.length; i++) view.setUint8(off + i, s.charCodeAt(i)); };
+    str(0, 'RIFF');
+    view.setUint32(4,  36 + samples.length * 2, true);
+    str(8, 'WAVE');
+    str(12, 'fmt ');
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1,  true);          // PCM
+    view.setUint16(22, 1,  true);          // mono
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 2, true);
+    view.setUint16(32, 2,  true);
+    view.setUint16(34, 16, true);
+    str(36, 'data');
+    view.setUint32(40, samples.length * 2, true);
+    let off = 44;
+    for (let i = 0; i < samples.length; i++) {
+        view.setInt16(off, Math.max(-1, Math.min(1, samples[i])) * 0x7FFF, true);
+        off += 2;
+    }
+    return new Blob([buf], { type: 'audio/wav' });
+}
+
 function stopVoice() {
     clearInterval(voiceInterval);
     clearInterval(voiceAnimInterval);
@@ -625,16 +752,53 @@ function stopVoice() {
     mediaRecorder.stream.getTracks().forEach(t => t.stop());
     showScreen('voice-sending');
 
-    setTimeout(() => {
-        const blob = new Blob(audioChunks, { type: 'audio/webm' });
+    setTimeout(async () => {
+        const mimeType = mediaRecorder.mimeType || 'audio/webm';
+        const rawBlob  = new Blob(audioChunks, { type: mimeType });
+
+        let uploadBlob, filename;
+        try {
+            // Decode the recorded audio (works for mp4, webm, etc.) and
+            // re-encode as standard 22050 Hz mono WAV so the server can
+            // read it with scipy without needing ffmpeg.
+            const arrayBuf = await rawBlob.arrayBuffer();
+            const audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 22050 });
+            const decoded  = await audioCtx.decodeAudioData(arrayBuf);
+
+            // Mix down to mono
+            const ch0 = decoded.getChannelData(0);
+            let mono;
+            if (decoded.numberOfChannels > 1) {
+                const ch1 = decoded.getChannelData(1);
+                mono = new Float32Array(ch0.length);
+                for (let i = 0; i < ch0.length; i++) mono[i] = (ch0[i] + ch1[i]) / 2;
+            } else {
+                mono = ch0;
+            }
+
+            uploadBlob = encodeWav(mono, decoded.sampleRate);
+            filename   = 'voice.wav';
+        } catch (e) {
+            // Fallback: send the raw blob if Web Audio decoding fails
+            console.warn('WAV encode failed, sending raw audio:', e);
+            const ext  = mimeType.includes('mp4') ? 'mp4' : 'webm';
+            uploadBlob = rawBlob;
+            filename   = `voice.${ext}`;
+        }
+
         const fd = new FormData();
-        fd.append('audio', blob, 'voice.webm');
+        fd.append('audio', uploadBlob, filename);
         fetch(getBase() + '/api/voice/analyze', { method: 'POST', body: fd })
             .then(r => r.json())
             .then(d => {
-                document.getElementById('voiceResultText').textContent =
-                    `Risk: ${d.risk_level} (${(d.probability_pd*100).toFixed(1)}% PD)`;
-                showScreen('voice-done');
+                if (d.error) {
+                    document.getElementById('voiceErrorText').textContent = d.error;
+                    showScreen('voice-error');
+                } else {
+                    document.getElementById('voiceResultText').textContent =
+                        `Risk: ${d.risk_level} (${(d.probability_pd*100).toFixed(1)}% PD)`;
+                    showScreen('voice-done');
+                }
             })
             .catch(err => {
                 document.getElementById('voiceErrorText').textContent = 'Analysis failed: ' + err.message;
